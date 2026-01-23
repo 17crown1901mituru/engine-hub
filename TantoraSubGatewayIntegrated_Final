@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tantora_SubGateway_Integrated_Final
 // @namespace    http://oitsuru.net/
-// @version      1.0
+// @version      1.2
 // @description  抗争セッション管理＋事前/ファイナルスキャン＋突入制御＋ロギング完全版
 // @match        *://tantora.jp/*
 // @grant        none
@@ -106,74 +106,144 @@
      *  事前スキャン
      **************************************************/
     async function preScan(tid, enemy, startStr) {
-        if (isPreScanning) return;
-        isPreScanning = true;
+    if (isPreScanning) return;
+    isPreScanning = true;
 
-        try {
-            const list = [];
-            let page = 1;
-            let total = null;
+    try {
+        const baseUrl = `https://tantora.jp/team/member-list?team_id=${tid}`;
+        const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-            while (true) {
-                const url = `https://tantora.jp/team/member-list?team_id=${tid}&page=${page}`;
-                const res = await fetch(url);
-                const html = await res.text();
-
-                if (page === 1) {
-                    const m = html.match(/全(\d+)件中/);
-                    total = m ? parseInt(m[1]) : null;
-                }
-
-                const reg = /other_id=(\d+)[^>]*>([^<]+)<\/a>.*?LV:(\d+)/gis;
-                let r;
-                while ((r = reg.exec(html)) !== null) {
-                    const id = r[1];
-                    const name = r[2].trim();
-                    const lv = parseInt(r[3]);
-                    const g = lv >= 2000 ? 'A' : lv >= 1500 ? 'B' : lv >= 1000 ? 'C' : 'D';
-                    list.push({ id, name, lv, g });
-                }
-
-                if (total != null) {
-                    const maxPage = Math.ceil(total / 5);
-                    if (page >= maxPage) break;
-                } else break;
-
-                page++;
-            }
-
-            const unique = Array.from(new Map(list.map(m => [m.id, m])).values());
-            localStorage.setItem(`${KEYS.STRATEGY}${tid}`, JSON.stringify(unique));
-
-            const sid = buildSessionId(tid, startStr);
-            localStorage.setItem(KEYS.ACTIVE_ID, sid);
-            localStorage.setItem(KEYS.ACTIVE_TID, tid);
-
-            let store = {};
-            try { store = JSON.parse(localStorage.getItem(KEYS.WAR_SESSIONS) || "{}"); }
-            catch(e){ store = {}; }
-
-            if (!store[sid]) {
-                store[sid] = {
-                    info: { tid, start: startStr, enemy },
-                    logs: []
-                };
-            }
-            localStorage.setItem(KEYS.WAR_SESSIONS, JSON.stringify(store));
-
-            pushWarLog("SCAN_COMPLETE", { res: "事前スキャン完了", count: unique.length });
-
-        } catch (e) {
-            pushWarLog("ERROR", { where: "preScan", detail: e.toString() });
-        } finally {
-            isPreScanning = false;
+        // --------------------------------------------------
+        // 1. 最初のページで総数取得
+        // --------------------------------------------------
+        const firstHtml = await fetch(baseUrl).then(r => r.text());
+        const totalMatch = firstHtml.match(/全(\d+)件中/);
+        if (!totalMatch) {
+            alert("敵メンバー総数の取得に失敗しました");
+            return;
         }
+
+        const total = Number(totalMatch[1]);
+        const pages = Math.ceil(total / 5);
+
+        // --------------------------------------------------
+        // HTML → メンバー抽出（旧版の正規表現パーサ）
+        // --------------------------------------------------
+        function parseMembersFromHtml(html) {
+            const list = [];
+            const reg = /other_id=(\d+)[^>]*>([^<]+)<\/a>.*?LV:(\d+)/gis;
+            let r;
+            while ((r = reg.exec(html)) !== null) {
+                const id = r[1];
+                const name = r[2].trim();
+                const lv = parseInt(r[3]);
+                const g = lv >= 2000 ? 'A'
+                        : lv >= 1500 ? 'B'
+                        : lv >= 1000 ? 'C'
+                        : 'D';
+                list.push({ id, name, lv, g });
+            }
+            return list;
+        }
+
+        // --------------------------------------------------
+        // 2. 順方向スキャン（1 → pages）
+        // --------------------------------------------------
+        let members = [];
+
+        for (let p = 1; p <= pages; p++) {
+            const url = p === 1 ? baseUrl : `${baseUrl}&page=${p}`;
+            const html = await fetch(url).then(r => r.text());
+
+            members.push(...parseMembersFromHtml(html));
+
+            await sleep(400); // ★ ページ移動ごとに必ず 400ms
+        }
+
+        // --------------------------------------------------
+        // 3. 検算（順方向）
+        // --------------------------------------------------
+        if (members.length !== total) {
+
+            // --------------------------------------------------
+            // 4. 差異 → 逆順スキャン（pages → 1）
+            // --------------------------------------------------
+            let fixed = new Map();
+
+            for (let p = pages; p >= 1; p--) {
+                const url = p === 1 ? baseUrl : `${baseUrl}&page=${p}`;
+                const html = await fetch(url).then(r => r.text());
+
+                const pageMembers = parseMembersFromHtml(html);
+
+                // ★ ID を唯一のキーとして重複排除
+                for (const m of pageMembers) {
+                    fixed.set(m.id, m);
+                }
+
+                await sleep(400); // ★ ページ移動ごとに必ず 400ms
+            }
+
+            members = [...fixed.values()];
+
+            // --------------------------------------------------
+            // 5. 再検算（逆順後）
+            // --------------------------------------------------
+            if (members.length !== total) {
+                alert(
+                    `【警告】敵メンバーの取得に失敗しました\n` +
+                    `解析人数：${members.length}人\n` +
+                    `総人数：${total}人\n` +
+                    `通信環境を確認してください`
+                );
+            }
+        }
+
+        // --------------------------------------------------
+        // 6. 旧版の後処理（そのまま使用）
+        // --------------------------------------------------
+
+        // ★ ID で重複排除（安全のため最終確認）
+        const unique = Array.from(new Map(members.map(m => [m.id, m])).values());
+
+        // ★ 保存
+        localStorage.setItem(`${KEYS.STRATEGY}${tid}`, JSON.stringify(unique));
+
+        // ★ セッション管理
+        const sid = buildSessionId(tid, startStr);
+        localStorage.setItem(KEYS.ACTIVE_ID, sid);
+        localStorage.setItem(KEYS.ACTIVE_TID, tid);
+
+        // ★ WAR_SESSIONS 管理
+        let store = {};
+        try { store = JSON.parse(localStorage.getItem(KEYS.WAR_SESSIONS) || "{}"); }
+        catch(e){ store = {}; }
+
+        if (!store[sid]) {
+            store[sid] = {
+                info: { tid, start: startStr, enemy },
+                logs: []
+            };
+        }
+        localStorage.setItem(KEYS.WAR_SESSIONS, JSON.stringify(store));
+
+        // ★ ログ
+        pushWarLog("SCAN_COMPLETE", {
+            res: "事前スキャン完了",
+            count: unique.length
+        });
+
+    } catch (e) {
+        pushWarLog("ERROR", { where: "preScan", detail: e.toString() });
+    } finally {
+        isPreScanning = false;
     }
+}
 
     /**************************************************
      *  メイン監視（抗争勃発!!リンク検知 → 事前スキャン）
      **************************************************/
-   function mainObserver() {
+    function mainObserver() {
     const raw = document.documentElement.innerHTML;
     const info = parseWarLink(raw);
 
