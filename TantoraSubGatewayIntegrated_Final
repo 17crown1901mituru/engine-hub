@@ -1,0 +1,522 @@
+// ==UserScript==
+// @name         Tantora_SubGateway_Integrated_Final
+// @namespace    http://oitsuru.net/
+// @version      1.0
+// @description  抗争セッション管理＋事前/ファイナルスキャン＋突入制御＋ロギング完全版
+// @match        *://tantora.jp/*
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    /**************************************************
+     *  共通キー（Viewer / 攻撃スクリプトと完全互換）
+     **************************************************/
+    const KEYS = {
+        WAR_SESSIONS: 'tantora_session_store',
+        SYS_SESSIONS: 'tantora_system_store',
+        ACTIVE_ID: 'tantora_active_session_id',
+        ACTIVE_TID: 'active_war_tid',
+        STRATEGY: 'strategy_',
+        FINAL: 'strategy_',
+        FINAL_DONE: 'war_final_adjust_done',
+        ATTACK_KILL: 'tantora_attack_kill_flag'
+    };
+
+    /**************************************************
+     *  内部状態
+     **************************************************/
+    let isPreScanning = false;
+    let isFinalScanning = false;
+    let isEnteringWar = false;
+    let finalScanTimer = null;
+    let warEntryTimer = null;
+
+    const now = () => new Date();
+    const logTime = () => now().toLocaleTimeString('ja-JP');
+
+    /**************************************************
+     *  ログ保存（Viewer互換）
+     **************************************************/
+    const pushWarLog = (type, data) => {
+        const sid = localStorage.getItem(KEYS.ACTIVE_ID);
+        if (!sid) return;
+
+        let store = {};
+        try { store = JSON.parse(localStorage.getItem(KEYS.WAR_SESSIONS) || "{}"); }
+        catch(e){ store = {}; }
+
+        if (!store[sid]) {
+            const tid = localStorage.getItem(KEYS.ACTIVE_TID) || "0";
+            store[sid] = {
+                info: { tid, start: "不明", enemy: "不明" },
+                logs: []
+            };
+        }
+
+        store[sid].logs.push({
+            t: logTime(),
+            type,
+            d: data
+        });
+
+        if (store[sid].logs.length > 200) store[sid].logs.shift();
+        localStorage.setItem(KEYS.WAR_SESSIONS, JSON.stringify(store));
+    };
+
+    /**************************************************
+     *  抗争勃発!!リンク解析
+     **************************************************/
+    function parseWarLink(html) {
+        const reg = /team_id=(\d+)[^>]*>([^<]+?)と抗争勃発!!<br\s*\/?>(\d{2}\/\d{2}\s\d{2}時\d{2}分)開戦/;
+        const m = html.match(reg);
+        if (!m) return null;
+
+        return {
+            tid: m[1],
+            enemy: m[2].trim(),
+            startStr: m[3]
+        };
+    }
+
+    function parseWarDate(startStr) {
+        const m = startStr.match(/(\d{2})\/(\d{2})\s(\d{2})時(\d{2})分/);
+        if (!m) return null;
+        const y = now().getFullYear();
+        return new Date(y, m[1]-1, m[2], m[3], m[4]);
+    }
+
+    function buildSessionId(tid, startStr) {
+        const compact = startStr.replace(/[^\d]/g, '').slice(0, 8);
+        return `${tid}_${compact}`;
+    }
+
+    function isSameSession(existingSid, tid, startStr) {
+        if (!existingSid) return false;
+        const parts = existingSid.split('_');
+        const sidTid = parts[0];
+        const sidTime = parts[1];
+        const newTime = startStr.replace(/[^\d]/g, '').slice(0, 8);
+        return sidTid === tid && sidTime === newTime;
+    }
+
+    /**************************************************
+     *  事前スキャン
+     **************************************************/
+    async function preScan(tid, enemy, startStr) {
+        if (isPreScanning) return;
+        isPreScanning = true;
+
+        try {
+            const list = [];
+            let page = 1;
+            let total = null;
+
+            while (true) {
+                const url = `https://tantora.jp/team/member-list?team_id=${tid}&page=${page}`;
+                const res = await fetch(url);
+                const html = await res.text();
+
+                if (page === 1) {
+                    const m = html.match(/全(\d+)件中/);
+                    total = m ? parseInt(m[1]) : null;
+                }
+
+                const reg = /other_id=(\d+)[^>]*>([^<]+)<\/a>.*?LV:(\d+)/gis;
+                let r;
+                while ((r = reg.exec(html)) !== null) {
+                    const id = r[1];
+                    const name = r[2].trim();
+                    const lv = parseInt(r[3]);
+                    const g = lv >= 2000 ? 'A' : lv >= 1500 ? 'B' : lv >= 1000 ? 'C' : 'D';
+                    list.push({ id, name, lv, g });
+                }
+
+                if (total != null) {
+                    const maxPage = Math.ceil(total / 5);
+                    if (page >= maxPage) break;
+                } else break;
+
+                page++;
+            }
+
+            const unique = Array.from(new Map(list.map(m => [m.id, m])).values());
+            localStorage.setItem(`${KEYS.STRATEGY}${tid}`, JSON.stringify(unique));
+
+            const sid = buildSessionId(tid, startStr);
+            localStorage.setItem(KEYS.ACTIVE_ID, sid);
+            localStorage.setItem(KEYS.ACTIVE_TID, tid);
+
+            let store = {};
+            try { store = JSON.parse(localStorage.getItem(KEYS.WAR_SESSIONS) || "{}"); }
+            catch(e){ store = {}; }
+
+            if (!store[sid]) {
+                store[sid] = {
+                    info: { tid, start: startStr, enemy },
+                    logs: []
+                };
+            }
+            localStorage.setItem(KEYS.WAR_SESSIONS, JSON.stringify(store));
+
+            pushWarLog("SCAN_COMPLETE", { res: "事前スキャン完了", count: unique.length });
+
+        } catch (e) {
+            pushWarLog("ERROR", { where: "preScan", detail: e.toString() });
+        } finally {
+            isPreScanning = false;
+        }
+    }
+
+    /**************************************************
+     *  メイン監視（抗争勃発!!リンク検知 → 事前スキャン）
+     **************************************************/
+    function mainObserver() {
+        const raw = document.documentElement.innerHTML;
+        const info = parseWarLink(raw);
+        if (!info) return;
+
+        const existingSid = localStorage.getItem(KEYS.ACTIVE_ID);
+        const same = isSameSession(existingSid, info.tid, info.startStr);
+
+        if (!same) {
+            preScan(info.tid, info.enemy, info.startStr);
+        }
+    }
+
+    if (document.readyState === 'loading') {
+        window.addEventListener('DOMContentLoaded', mainObserver);
+    } else {
+        mainObserver();
+    }
+
+})();
+
+/**************************************************
+ *  ファイナルスキャン（抗争開始15分前トリガー）
+ **************************************************/
+async function finalScan(tid, enemy, startStr) {
+    if (isFinalScanning) return;
+    isFinalScanning = true;
+
+    try {
+        /**********************************************
+         * 1. 再度 HTML から抗争勃発!!リンクを取得
+         **********************************************/
+        const raw = document.documentElement.innerHTML;
+        const info = parseWarLink(raw);
+
+        if (!info) {
+            pushWarLog("ERROR", { where: "finalScan", detail: "抗争リンク再取得失敗" });
+            return;
+        }
+
+        /**********************************************
+         * 2. 事前データと tid / startStr が一致するか確認
+         **********************************************/
+        const existingSid = localStorage.getItem(KEYS.ACTIVE_ID);
+        const same = isSameSession(existingSid, info.tid, info.startStr);
+
+        if (!same) {
+            // 別抗争と判断 → 事前スキャンからやり直し
+            pushWarLog("INFO", {
+                res: "別抗争検出 → 事前スキャンに戻る",
+                oldSid: existingSid,
+                newTid: info.tid,
+                newStart: info.startStr
+            });
+
+            await preScan(info.tid, info.enemy, info.startStr);
+            return;
+        }
+
+        /**********************************************
+         * 3. メンバーリストを再取得（事前スキャンと同じ処理）
+         **********************************************/
+        const list = [];
+        let page = 1;
+        let total = null;
+
+        while (true) {
+            const url = `https://tantora.jp/team/member-list?team_id=${info.tid}&page=${page}`;
+            const res = await fetch(url);
+            const html = await res.text();
+
+            if (page === 1) {
+                const m = html.match(/全(\d+)件中/);
+                total = m ? parseInt(m[1]) : null;
+            }
+
+            const reg = /other_id=(\d+)[^>]*>([^<]+)<\/a>.*?LV:(\d+)/gis;
+            let r;
+            while ((r = reg.exec(html)) !== null) {
+                const id = r[1];
+                const name = r[2].trim();
+                const lv = parseInt(r[3]);
+                const g = lv >= 2000 ? 'A' : lv >= 1500 ? 'B' : lv >= 1000 ? 'C' : 'D';
+                list.push({ id, name, lv, g });
+            }
+
+            if (total != null) {
+                const maxPage = Math.ceil(total / 5);
+                if (page >= maxPage) break;
+            } else break;
+
+            page++;
+        }
+
+        const unique = Array.from(new Map(list.map(m => [m.id, m])).values());
+
+        /**********************************************
+         * 4. ファイナルデータとして保存
+         **********************************************/
+        localStorage.setItem(`${KEYS.STRATEGY}${info.tid}_final`, JSON.stringify(unique));
+
+        const sid = localStorage.getItem(KEYS.ACTIVE_ID);
+        localStorage.setItem(KEYS.FINAL_DONE, sid);
+
+        pushWarLog("STRATEGY_LOCKED", {
+            res: "ファイナルスキャン完了（確定）",
+            count: unique.length
+        });
+
+        /**********************************************
+         * 5. 抗争突入準備へ移行
+         **********************************************/
+        scheduleWarEntry(info.tid, info.startStr);
+
+    } catch (e) {
+        pushWarLog("ERROR", { where: "finalScan", detail: e.toString() });
+    } finally {
+        isFinalScanning = false;
+    }
+}
+
+/**************************************************
+ *  ファイナルスキャンの時間トリガー設定
+ **************************************************/
+function scheduleFinalScan(tid, enemy, startStr) {
+    if (finalScanTimer) return;
+
+    const warDate = parseWarDate(startStr);
+    if (!warDate) return;
+
+    const triggerTime = warDate.getTime() - 15 * 60 * 1000; // 15分前
+    const delay = Math.max(0, triggerTime - now().getTime());
+
+    finalScanTimer = setTimeout(() => {
+        finalScan(tid, enemy, startStr);
+    }, delay);
+
+    pushWarLog("INFO", {
+        res: "ファイナルスキャン予約完了",
+        trigger: new Date(triggerTime).toLocaleString()
+    });
+}
+
+/**************************************************
+ *  抗争突入準備（開始2秒前から 400ms 間隔で突入）
+ **************************************************/
+function scheduleWarEntry(tid, startStr) {
+    if (isEnteringWar) return;
+    isEnteringWar = true;
+
+    const warDate = parseWarDate(startStr);
+    if (!warDate) {
+        pushWarLog("ERROR", { where: "scheduleWarEntry", detail: "開始日時パース失敗" });
+        return;
+    }
+
+    const targetTime = warDate.getTime() - 2000; // 開始2秒前
+
+    const waitUntil2secBefore = () => {
+        const nowTime = now().getTime();
+        if (nowTime < targetTime) {
+            // まだ早い → 500ms後に再チェック
+            warEntryTimer = setTimeout(waitUntil2secBefore, 500);
+            return;
+        }
+        // ここから突入リトライ開始
+        tryEnterWar();
+    };
+
+    const tryEnterWar = () => {
+        // すでに war/member-list に入れているか？
+        if (location.pathname.includes("/war/member-list")) {
+            pushWarLog("INFO", { res: "抗争画面突入成功 → ロギング開始" });
+            startWarLogging();
+            return;
+        }
+
+        // まだ入れていない → 400ms 間隔で突入を試みる
+        location.href = `https://tantora.jp/war/member-list?team_id=${tid}`;
+        warEntryTimer = setTimeout(tryEnterWar, 400);
+    };
+
+    pushWarLog("INFO", {
+        res: "抗争突入準備開始",
+        target: new Date(targetTime).toLocaleString()
+    });
+
+    waitUntil2secBefore();
+}
+
+/**************************************************
+ *  fetch パッチ（裏側通信のみロギング）
+ **************************************************/
+function patchFetchForLogging() {
+    if (window.__fetch_patched__) return; // 二重パッチ防止
+    window.__fetch_patched__ = true;
+
+    const originalFetch = window.fetch;
+
+    window.fetch = async (...args) => {
+        const res = await originalFetch(...args);
+
+        try {
+            const url = args[0]?.toString() || "";
+
+            // 抗争関連通信のみログ対象
+            if (url.includes("/war/")) {
+                const clone = res.clone();
+                clone.text().then(text => {
+                    // 画面に表示される情報はログ対象外
+                    // → ここでは裏側通信（レスポンス全文）を保存
+                    pushWarLog("FETCH_RES", {
+                        url,
+                        res: text
+                    });
+                });
+            }
+        } catch (e) {
+            pushWarLog("ERROR", { where: "fetchPatch", detail: e.toString() });
+        }
+
+        return res;
+    };
+}
+
+/**************************************************
+ *  抗争画面突入後のロギング開始
+ **************************************************/
+function startWarLogging() {
+    pushWarLog("INFO", { res: "ロギングモード開始（抗争中）" });
+
+    // fetch パッチを適用（1回だけ）
+    patchFetchForLogging();
+
+    // 抗争終了検知を定期実行
+    setInterval(checkWarEnd, 3000);
+}
+
+/**************************************************
+ *  抗争終了画面の終了日時を抽出
+ *  例: 【抗争終了日時】11/09 20:11
+ **************************************************/
+function parseWarEndDate(html) {
+    const m = html.match(/抗争終了日時】(\d{2})\/(\d{2})\s(\d{2}):(\d{2})/);
+    if (!m) return null;
+
+    const nowYear = now().getFullYear();
+    const month = parseInt(m[1]);
+    const day = parseInt(m[2]);
+    const hour = parseInt(m[3]);
+    const min = parseInt(m[4]);
+
+    return new Date(nowYear, month - 1, day, hour, min);
+}
+
+/**************************************************
+ *  開始日時と終了日時の整合性チェック
+ *  0時跨ぎ・年跨ぎにも対応
+ **************************************************/
+function isSameWarSession(startDate, endDate) {
+    if (!startDate || !endDate) return false;
+
+    // 0時跨ぎ補正
+    if (endDate < startDate) {
+        endDate = new Date(
+            endDate.getFullYear(),
+            endDate.getMonth(),
+            endDate.getDate() + 1,
+            endDate.getHours(),
+            endDate.getMinutes()
+        );
+    }
+
+    // 年跨ぎ補正（12月 → 1月）
+    if (startDate.getMonth() === 11 && endDate.getMonth() === 0) {
+        endDate = new Date(
+            startDate.getFullYear() + 1,
+            endDate.getMonth(),
+            endDate.getDate(),
+            endDate.getHours(),
+            endDate.getMinutes()
+        );
+    }
+
+    // 終了日時が開始日時より後なら同じ抗争
+    return endDate.getTime() >= startDate.getTime();
+}
+
+/**************************************************
+ *  抗争終了判定
+ **************************************************/
+function checkWarEnd() {
+    const raw = document.documentElement.innerHTML;
+
+    // 終了日時を抽出
+    const endDate = parseWarEndDate(raw);
+    if (!endDate) return; // 終了画面ではない
+
+    // 確定データの開始日時を取得
+    const sid = localStorage.getItem(KEYS.ACTIVE_ID);
+    if (!sid) return;
+
+    const tid = localStorage.getItem(KEYS.ACTIVE_TID);
+    const finalData = localStorage.getItem(`${KEYS.STRATEGY}${tid}_final`);
+    if (!finalData) return;
+
+    // セッションIDから開始日時を復元
+    const parts = sid.split("_");
+    const compact = parts[1]; // MMDDHHmm
+    const mm = compact.slice(0, 2);
+    const dd = compact.slice(2, 4);
+    const HH = compact.slice(4, 6);
+    const MM = compact.slice(6, 8);
+
+    const startDate = new Date(
+        now().getFullYear(),
+        parseInt(mm) - 1,
+        parseInt(dd),
+        parseInt(HH),
+        parseInt(MM)
+    );
+
+    // 同じ抗争かどうか判定
+    if (!isSameWarSession(startDate, endDate)) {
+        return; // 別抗争の終了画面 → 無視
+    }
+
+    /**************************************************
+     *  抗争終了確定
+     **************************************************/
+    pushWarLog("INFO", {
+        res: "抗争終了を検知（確定）",
+        end: endDate.toLocaleString()
+    });
+
+    // 攻撃スクリプト停止フラグ
+    localStorage.setItem(KEYS.ATTACK_KILL, sid);
+
+    // 状態初期化（次の抗争に備える）
+    isEnteringWar = false;
+    isFinalScanning = false;
+    isPreScanning = false;
+    finalScanTimer = null;
+    warEntryTimer = null;
+
+    pushWarLog("INFO", { res: "攻撃スクリプト停止指示 → 状態初期化完了" });
+}
