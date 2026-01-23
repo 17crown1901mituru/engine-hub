@@ -173,24 +173,105 @@
     /**************************************************
      *  メイン監視（抗争勃発!!リンク検知 → 事前スキャン）
      **************************************************/
-    function mainObserver() {
-        const raw = document.documentElement.innerHTML;
-        const info = parseWarLink(raw);
-        if (!info) return;
+   function mainObserver() {
+    const raw = document.documentElement.innerHTML;
+    const info = parseWarLink(raw);
 
+    if (info) {
+        // 勃発リンクあり → 通常処理
         const existingSid = localStorage.getItem(KEYS.ACTIVE_ID);
         const same = isSameSession(existingSid, info.tid, info.startStr);
 
         if (!same) {
             preScan(info.tid, info.enemy, info.startStr);
         }
+
+        // ファイナルスキャン予約
+        scheduleFinalScan(info.tid, info.enemy, info.startStr);
+        return;
     }
 
-    if (document.readyState === 'loading') {
-        window.addEventListener('DOMContentLoaded', mainObserver);
-    } else {
-        mainObserver();
+    // 勃発リンクなし → 抗争中ログインの可能性をチェック
+    detectWarOngoingWithoutLink();
+}
+
+
+/**************************************************
+ *  抗争中ログイン復元ロジック（★ mainObserver の外に置く ★）
+ **************************************************/
+function detectWarOngoingWithoutLink() {
+
+    // 1. 勃発リンクが無い場合のみ実行
+    const raw = document.documentElement.innerHTML;
+    const info = parseWarLink(raw);
+    if (info) return; // 勃発リンクがある → 通常処理へ
+
+    // 2. メニューバーの抗争アイコン（war.jpg）を確認
+    const warIcon = document.querySelector('#header_menu img[src*="head/war.jpg"]');
+    if (!warIcon) return; // 抗争予定なし → 何もしない
+
+    // 3. 抗争中ログインと判定
+    pushWarLog("INFO", { res: "抗争中ログインを検知（勃発リンクなし＋war.jpg）" });
+
+    // 4. 抗争画面へ遷移して tid を取得
+    const warHref = warIcon.parentNode.href;
+    if (!warHref) {
+        pushWarLog("ERROR", { where: "detectWarOngoingWithoutLink", detail: "抗争画面リンク取得失敗" });
+        return;
     }
+
+    // 5. 抗争画面へ遷移して tid を取得
+    fetch(warHref)
+        .then(res => res.text())
+        .then(html => {
+
+            const tidMatch = html.match(/team_id=(\d+)/);
+            if (!tidMatch) {
+                pushWarLog("ERROR", { where: "detectWarOngoingWithoutLink", detail: "tid抽出失敗" });
+                return;
+            }
+
+            const tid = tidMatch[1];
+            localStorage.setItem(KEYS.ACTIVE_TID, tid);
+
+            // 6. 事前データがあるか確認
+            const pre = localStorage.getItem(`${KEYS.STRATEGY}${tid}`);
+
+            if (pre) {
+                // 事前データあり → そのまま確定データとして採用
+                localStorage.setItem(`${KEYS.STRATEGY}${tid}_final`, pre);
+
+                const sid = buildSessionId(tid, "00000000"); // 開始時刻不明 → 仮ID
+                localStorage.setItem(KEYS.ACTIVE_ID, sid);
+                localStorage.setItem(KEYS.FINAL_DONE, sid);
+
+                pushWarLog("INFO", { res: "抗争中ログイン → 事前データを確定データとして採用" });
+
+                // 抗争画面突入
+                location.href = `https://tantora.jp/war/member-list?team_id=${tid}`;
+                return;
+            }
+
+            // 7. 事前データなし → バーサーカーモード
+            const sid = buildSessionId(tid, "00000000");
+            localStorage.setItem(KEYS.ACTIVE_ID, sid);
+
+            pushWarLog("INFO", { res: "抗争中ログイン → 事前データなし → バーサーカーモード" });
+
+            // 攻撃スクリプトへ通知
+            localStorage.setItem("tantora_berserk_mode", "1");
+
+            // 抗争画面突入
+            location.href = `https://tantora.jp/war/member-list?team_id=${tid}`;
+        });
+}
+
+
+if (document.readyState === 'loading') {
+    window.addEventListener('DOMContentLoaded', mainObserver);
+} else {
+    mainObserver();
+}
 
 })();
 
