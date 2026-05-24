@@ -2,7 +2,7 @@ name: Android CI (Auto APK Build)
 
 on:
   push:
-    branches: [ "main", "master" ] # mainまたはmasterにプッシュされたら起動
+    branches: [ "main", "master" ]
 
 jobs:
   build:
@@ -21,7 +21,7 @@ jobs:
 
     - name: Grant execute permission for gradlew
       run: chmod +x gradlew
-      continue-on-error: true # gradlewがリポジトリになくてもActions側で自動生成するため許容
+      continue-on-error: true
 
     - name: Create Gradle Wrapper if missing
       run: |
