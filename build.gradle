@@ -8,16 +8,6 @@ buildscript {
         classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.22'
     }
 }
-
-allprojects {
-    repositories {
-        google()
-        mavenCentral()
-        // GitHubプロジェクトを直接Gradleの依存関係にコンパイルするための必須ゲート
-        maven { url 'https://jitpack.io' } 
-    }
-}
-
 task clean(type: Delete) {
     delete rootProject.buildDir
 }
