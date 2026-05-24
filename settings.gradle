@@ -6,11 +6,14 @@ pluginManagement {
     }
 }
 dependencyResolutionManagement {
+    // 優先順位を明確化し、build.gradle 側での重複定義によるエラーを防ぐ安全弁
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
         google()
         mavenCentral()
-        maven { url 'https://jitpack.io' } // 依存解決用の共有エンドポイント
+        
+        // ★本命：GitHubの glview-kit をリモート結合するための一元管理窓口
+        maven { url 'https://jitpack.io' }
     }
 }
 rootProject.name = "LiteBrowser"
